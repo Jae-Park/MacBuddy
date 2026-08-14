@@ -1,0 +1,9 @@
+.DS_Store
+.build/
+Build/
+dist/
+
+# Local design experiments and superseded sprite assets
+Design/
+Sources/MacBuddy/Assets/*-32.png
+Sources/MacBuddy/Assets/*-256.png
