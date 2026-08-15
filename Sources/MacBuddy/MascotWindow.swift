@@ -409,7 +409,7 @@ private final class MascotCanvasView: NSView {
             .version: "\(tr("Build", "빌드")) \(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "1")",
             .applicationIcon: spritePack.icon(),
             .credits: NSAttributedString(
-                string: "Created by Jaeyong Park\nA tiny pixel companion for your Mac.\n\n개발자: 박재용\n맥의 시스템 상태를 한눈에 보여주는\n작은 픽셀 친구입니다.",
+                string: "Created by Jaeyong Park\nA tiny pixel companion for your Mac.",
                 attributes: [.foregroundColor: NSColor.secondaryLabelColor]
             )
         ]
