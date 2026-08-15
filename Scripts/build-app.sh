@@ -29,6 +29,8 @@ codesign --verify --deep --strict "$staged_app"
 
 mkdir -p "$dist_dir"
 ditto "$staged_app" "$app_dir"
+xattr -cr "$app_dir"
+codesign --verify --deep --strict "$app_dir"
 
 echo "Built $app_dir"
 file "$staged_app/Contents/MacOS/MacBuddy"

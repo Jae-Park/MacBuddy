@@ -1,4 +1,5 @@
 import AppKit
+import ImageIO
 
 enum CharacterKind: String, CaseIterable {
     case mint
@@ -9,9 +10,9 @@ enum CharacterKind: String, CaseIterable {
 
     var displayName: String {
         switch self {
-        case .mint: "Mint Buddy"
-        case .chip: "Memory Chip"
-        case .cake: "Strawberry Cake"
+        case .mint: tr("Mint Buddy", "민트 버디")
+        case .chip: tr("Memory Chip", "메모리 칩")
+        case .cake: tr("Strawberry Cake", "딸기 케이크")
         }
     }
 
@@ -27,7 +28,7 @@ enum CharacterKind: String, CaseIterable {
     }
 }
 
-enum SpriteFrame: Int {
+enum SpriteFrame: Int, CaseIterable {
     case front = 0
     case blink = 1
     case idleAlt = 2
@@ -39,15 +40,15 @@ enum SpriteFrame: Int {
 @MainActor
 final class SpriteFramePack {
     let kind: CharacterKind
-    private let sheet: NSImage?
+    private let frames: [SpriteFrame: NSImage]
     private static let frameSize: CGFloat = 48
 
     init(kind: CharacterKind) {
         self.kind = kind
         switch kind {
-        case .mint: sheet = Self.load("macbuddy-mint-frames-48")
-        case .chip: sheet = Self.load("macbuddy-chip-frames-48")
-        case .cake: sheet = Self.load("macbuddy-cake-frames-48")
+        case .mint: frames = Self.loadFrames("macbuddy-mint-frames-48")
+        case .chip: frames = Self.loadFrames("macbuddy-chip-frames-48")
+        case .cake: frames = Self.loadFrames("macbuddy-cake-frames-48")
         }
     }
 
@@ -63,14 +64,15 @@ final class SpriteFramePack {
             transform.concat()
         }
 
-        if let sheet {
-            let source = NSRect(
-                x: CGFloat(frame.rawValue) * Self.frameSize,
-                y: 0,
-                width: Self.frameSize,
-                height: Self.frameSize
+        if let image = frames[frame] {
+            image.draw(
+                in: destination,
+                from: NSRect(origin: .zero, size: image.size),
+                operation: .sourceOver,
+                fraction: 1,
+                respectFlipped: true,
+                hints: nil
             )
-            sheet.draw(in: destination, from: source, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
         }
 
         NSGraphicsContext.restoreGraphicsState()
@@ -82,10 +84,10 @@ final class SpriteFramePack {
         NSGraphicsContext.current?.imageInterpolation = .none
         NSGraphicsContext.current?.shouldAntialias = false
         let target = NSRect(x: 0, y: 0, width: size, height: size)
-        if let sheet {
-            sheet.draw(
+        if let image = frames[.front] {
+            image.draw(
                 in: target,
-                from: NSRect(x: 0, y: 0, width: Self.frameSize, height: Self.frameSize),
+                from: NSRect(origin: .zero, size: image.size),
                 operation: .sourceOver,
                 fraction: 1,
                 respectFlipped: false,
@@ -96,8 +98,26 @@ final class SpriteFramePack {
         return icon
     }
 
-    private static func load(_ name: String) -> NSImage? {
-        guard let url = Bundle.module.url(forResource: name, withExtension: "png") else { return nil }
-        return NSImage(contentsOf: url)
+    private static func loadFrames(_ name: String) -> [SpriteFrame: NSImage] {
+        guard let url = Bundle.module.url(forResource: name, withExtension: "png"),
+              let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let sheet = CGImageSourceCreateImageAtIndex(source, 0, [
+                  kCGImageSourceShouldCacheImmediately: true,
+                  kCGImageSourceShouldCache: true
+              ] as CFDictionary)
+        else { return [:] }
+
+        return SpriteFrame.allCases.reduce(into: [:]) { result, frame in
+            let sourceRect = CGRect(
+                x: CGFloat(frame.rawValue) * frameSize,
+                y: 0,
+                width: frameSize,
+                height: frameSize
+            )
+            guard let cropped = sheet.cropping(to: sourceRect) else { return }
+            let image = NSImage(cgImage: cropped, size: NSSize(width: frameSize, height: frameSize))
+            image.cacheMode = .never
+            result[frame] = image
+        }
     }
 }

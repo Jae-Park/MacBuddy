@@ -58,6 +58,7 @@ private final class StatusBarController: NSObject, NSPopoverDelegate {
     private let statusItem: NSStatusItem
     private let popover = NSPopover()
     private let dashboard: DashboardViewController
+    private var renderedStatus: HealthStatus?
 
     init(monitor: SystemMonitor, mascot: MascotWindowController) {
         self.monitor = monitor
@@ -84,6 +85,12 @@ private final class StatusBarController: NSObject, NSPopoverDelegate {
             name: .systemMonitorDidUpdate,
             object: monitor
         )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(languageDidChange),
+            name: .appLanguageDidChange,
+            object: nil
+        )
         updateStatusIcon()
     }
 
@@ -103,15 +110,24 @@ private final class StatusBarController: NSObject, NSPopoverDelegate {
         if popover.isShown { dashboard.update() }
     }
 
+    @objc private func languageDidChange() {
+        updateStatusIcon(force: true)
+    }
+
     func popoverWillClose(_ notification: Notification) {
         monitor.dashboardClosed()
     }
 
-    private func updateStatusIcon() {
+    private func updateStatusIcon(force: Bool = false) {
         guard let button = statusItem.button else { return }
+        guard force || renderedStatus != monitor.status else { return }
+        renderedStatus = monitor.status
         let image = NSImage(systemSymbolName: monitor.statusSymbol, accessibilityDescription: monitor.statusTitle)
+            ?? NSImage(systemSymbolName: "circle.fill", accessibilityDescription: monitor.statusTitle)
         image?.isTemplate = true
         button.image = image
+        button.title = image == nil ? "●" : ""
+        button.imagePosition = image == nil ? .noImage : .imageOnly
         button.setAccessibilityLabel("MacBuddy, \(monitor.statusTitle)")
     }
 }
@@ -123,20 +139,29 @@ private final class DashboardViewController: NSViewController {
 
     private let statusLabel = NSTextField(labelWithString: "")
     private let statusDot = NSTextField(labelWithString: "●")
-    private let memoryRow = MetricRowView(title: "Memory")
-    private let cpuRow = MetricRowView(title: "CPU load")
-    private let diskRow = MetricRowView(title: "Disk")
+    private let memoryRow = MetricRowView(title: "")
+    private let cpuRow = MetricRowView(title: "")
+    private let diskRow = MetricRowView(title: "")
     private let processStack = NSStackView()
+    private let processEmptyLabel = NSTextField(labelWithString: "")
+    private var processRows: [ProcessRowView] = []
     private let chart = HealthHistoryChartView()
     private let floatingSwitch = NSSwitch()
     private let alertsSwitch = NSSwitch()
+    private let languagePopup = NSPopUpButton()
     private var optimizationWindow: MemoryOptimizationWindowController?
 
     init(monitor: SystemMonitor, mascot: MascotWindowController) {
         self.monitor = monitor
         self.mascot = mascot
         super.init(nibName: nil, bundle: nil)
-        preferredContentSize = NSSize(width: 330, height: 650)
+        preferredContentSize = NSSize(width: 330, height: 680)
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(appLanguageDidChange),
+            name: .appLanguageDidChange,
+            object: nil
+        )
     }
 
     required init?(coder: NSCoder) {
@@ -144,7 +169,7 @@ private final class DashboardViewController: NSViewController {
     }
 
     override func loadView() {
-        view = NSView(frame: NSRect(x: 0, y: 0, width: 330, height: 610))
+        view = NSView(frame: NSRect(x: 0, y: 0, width: 330, height: 650))
 
         let root = NSStackView()
         root.orientation = .vertical
@@ -164,7 +189,7 @@ private final class DashboardViewController: NSViewController {
         root.addArrangedSubview(diskRow)
         root.addArrangedSubview(makeRule())
 
-        let processTitle = NSTextField(labelWithString: "Memory-heavy apps")
+        let processTitle = NSTextField(labelWithString: tr("Memory-heavy apps", "메모리를 많이 쓰는 앱"))
         processTitle.font = .systemFont(ofSize: 13, weight: .semibold)
         root.addArrangedSubview(processTitle)
         processStack.orientation = .vertical
@@ -179,8 +204,9 @@ private final class DashboardViewController: NSViewController {
         root.addArrangedSubview(chart)
         root.addArrangedSubview(makeRule())
 
-        root.addArrangedSubview(makeToggleRow(title: "Floating buddy", control: floatingSwitch))
-        root.addArrangedSubview(makeToggleRow(title: "Notify when strained", control: alertsSwitch))
+        root.addArrangedSubview(makeToggleRow(title: tr("Floating buddy", "플로팅 버디"), control: floatingSwitch))
+        root.addArrangedSubview(makeToggleRow(title: tr("Notify when strained", "상태가 나쁠 때 알림"), control: alertsSwitch))
+        root.addArrangedSubview(makeLanguageRow())
         root.addArrangedSubview(makeFooter())
 
         floatingSwitch.target = self
@@ -192,12 +218,15 @@ private final class DashboardViewController: NSViewController {
 
     func update() {
         guard isViewLoaded else { return }
+        memoryRow.setTitle(tr("Memory", "메모리"))
+        cpuRow.setTitle(tr("CPU usage", "CPU 사용률"))
+        diskRow.setTitle(tr("Disk", "디스크"))
         statusLabel.stringValue = monitor.statusTitle
         statusLabel.textColor = monitor.statusColor
         statusDot.textColor = monitor.statusColor
-        memoryRow.set(value: monitor.memorySummaryEnglish, detail: monitor.memoryDetail)
-        cpuRow.set(value: monitor.cpuSummary, detail: "1-minute system load")
-        diskRow.set(value: monitor.diskSummary, detail: "available on startup disk")
+        memoryRow.set(value: monitor.memorySummary, detail: monitor.memoryDetail)
+        cpuRow.set(value: monitor.cpuSummary, detail: tr("Current system usage", "현재 시스템 사용률"))
+        diskRow.set(value: monitor.diskSummary, detail: tr("available on startup disk", "시동 디스크 여유 공간"))
         chart.samples = monitor.history
         floatingSwitch.state = mascot.isVisible ? .on : .off
         alertsSwitch.state = monitor.alertsEnabled ? .on : .off
@@ -210,6 +239,19 @@ private final class DashboardViewController: NSViewController {
 
     @objc private func alertsChanged() {
         monitor.setAlertsEnabled(alertsSwitch.state == .on)
+    }
+
+    @objc private func languageSelectionChanged() {
+        guard let rawValue = languagePopup.selectedItem?.representedObject as? String,
+              let language = AppLanguage(rawValue: rawValue)
+        else { return }
+        language.select()
+    }
+
+    @objc private func appLanguageDidChange() {
+        guard isViewLoaded else { return }
+        loadView()
+        update()
     }
 
     @objc private func refreshNow() {
@@ -230,40 +272,50 @@ private final class DashboardViewController: NSViewController {
     }
 
     @objc private func requestProcessQuit(_ sender: NSButton) {
-        guard let process = monitor.topProcesses.first(where: { $0.id == Int32(sender.tag) }) else { return }
+        guard let process = monitor.topProcesses.first(where: { $0.id == Int32(sender.tag) }),
+              process.isRegularApplication,
+              !process.isProtected
+        else { return }
         NSApplication.shared.activate(ignoringOtherApps: true)
         let alert = NSAlert()
-        alert.messageText = "Quit \(process.name)?"
-        alert.informativeText = "MacBuddy will request a normal app quit, never a force-quit. Unsaved work may need your confirmation."
+        alert.messageText = tr("Quit \(process.name)?", "\(process.name)을(를) 종료할까요?")
+        alert.informativeText = tr(
+            "MacBuddy will request a normal app quit, never a force-quit. Unsaved work may need your confirmation.",
+            "MacBuddy는 강제 종료가 아닌 일반 종료만 요청합니다. 저장하지 않은 작업이 있다면 확인이 필요할 수 있습니다."
+        )
         alert.alertStyle = .warning
-        alert.addButton(withTitle: "Quit")
-        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: tr("Quit", "종료"))
+        alert.addButton(withTitle: tr("Cancel", "취소"))
         if alert.runModal() == .alertFirstButtonReturn {
             monitor.quit(process)
         }
     }
 
     private func rebuildProcesses() {
-        for child in processStack.arrangedSubviews {
-            processStack.removeArrangedSubview(child)
-            child.removeFromSuperview()
+        if processRows.isEmpty {
+            for _ in 0..<4 {
+                let row = ProcessRowView(target: self, action: #selector(requestProcessQuit(_:)))
+                processRows.append(row)
+                processStack.addArrangedSubview(row)
+            }
+            processEmptyLabel.font = .systemFont(ofSize: 11)
+            processEmptyLabel.textColor = .secondaryLabelColor
+            processStack.addArrangedSubview(processEmptyLabel)
         }
 
-        guard !monitor.topProcesses.isEmpty else {
-            let empty = NSTextField(labelWithString: "Collecting local process data…")
-            empty.font = .systemFont(ofSize: 11)
-            empty.textColor = .secondaryLabelColor
-            processStack.addArrangedSubview(empty)
-            return
-        }
-
-        for process in monitor.topProcesses.prefix(4) {
-            processStack.addArrangedSubview(makeProcessRow(process))
+        let processes = Array(monitor.topProcesses.prefix(4))
+        processEmptyLabel.stringValue = tr("Collecting local process data…", "로컬 프로세스 정보를 수집하는 중…")
+        processEmptyLabel.isHidden = !processes.isEmpty
+        for (index, row) in processRows.enumerated() {
+            row.configure(
+                process: index < processes.count ? processes[index] : nil,
+                tintColor: monitor.statusColor
+            )
         }
     }
 
     private func makeOptimizeButton() -> NSButton {
-        let button = NSButton(title: "Optimize Memory…", target: self, action: #selector(showMemoryOptimization))
+        let button = NSButton(title: tr("Optimize Memory…", "메모리 최적화…"), target: self, action: #selector(showMemoryOptimization))
         button.image = NSImage(systemSymbolName: "memorychip", accessibilityDescription: nil)
         button.imagePosition = .imageLeading
         button.bezelStyle = .rounded
@@ -301,50 +353,6 @@ private final class DashboardViewController: NSViewController {
         return container
     }
 
-    private func makeProcessRow(_ process: ProcessSnapshot) -> NSView {
-        let row = NSView()
-        row.translatesAutoresizingMaskIntoConstraints = false
-        row.heightAnchor.constraint(equalToConstant: 24).isActive = true
-        row.widthAnchor.constraint(equalToConstant: 298).isActive = true
-
-        let icon = NSImageView(image: NSImage(systemSymbolName: "bolt.circle", accessibilityDescription: nil) ?? NSImage())
-        icon.contentTintColor = monitor.statusColor
-        icon.translatesAutoresizingMaskIntoConstraints = false
-        let name = NSTextField(labelWithString: process.name)
-        name.font = .systemFont(ofSize: 10.5)
-        name.lineBreakMode = .byTruncatingTail
-        name.translatesAutoresizingMaskIntoConstraints = false
-        let detail = NSTextField(labelWithString: String(format: "%.0f MB · %.0f%%", process.memoryMB, process.cpu))
-        detail.font = .monospacedDigitSystemFont(ofSize: 9.5, weight: .regular)
-        detail.textColor = .secondaryLabelColor
-        detail.translatesAutoresizingMaskIntoConstraints = false
-        let quit = NSButton(title: "Quit", target: self, action: #selector(requestProcessQuit(_:)))
-        quit.controlSize = .small
-        quit.bezelStyle = .rounded
-        quit.tag = Int(process.id)
-        quit.translatesAutoresizingMaskIntoConstraints = false
-
-        row.addSubview(icon)
-        row.addSubview(name)
-        row.addSubview(detail)
-        row.addSubview(quit)
-        NSLayoutConstraint.activate([
-            icon.leadingAnchor.constraint(equalTo: row.leadingAnchor),
-            icon.centerYAnchor.constraint(equalTo: row.centerYAnchor),
-            icon.widthAnchor.constraint(equalToConstant: 14),
-            icon.heightAnchor.constraint(equalToConstant: 14),
-            name.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 6),
-            name.centerYAnchor.constraint(equalTo: row.centerYAnchor),
-            detail.leadingAnchor.constraint(greaterThanOrEqualTo: name.trailingAnchor, constant: 5),
-            detail.centerYAnchor.constraint(equalTo: row.centerYAnchor),
-            quit.leadingAnchor.constraint(equalTo: detail.trailingAnchor, constant: 6),
-            quit.trailingAnchor.constraint(equalTo: row.trailingAnchor),
-            quit.centerYAnchor.constraint(equalTo: row.centerYAnchor),
-            name.widthAnchor.constraint(lessThanOrEqualToConstant: 100)
-        ])
-        return row
-    }
-
     private func makeToggleRow(title: String, control: NSSwitch) -> NSView {
         let row = NSView()
         row.translatesAutoresizingMaskIntoConstraints = false
@@ -366,13 +374,46 @@ private final class DashboardViewController: NSViewController {
         return row
     }
 
+    private func makeLanguageRow() -> NSView {
+        let row = NSView()
+        row.translatesAutoresizingMaskIntoConstraints = false
+        row.heightAnchor.constraint(equalToConstant: 26).isActive = true
+        row.widthAnchor.constraint(equalToConstant: 298).isActive = true
+
+        let label = NSTextField(labelWithString: tr("Language", "언어"))
+        label.font = .systemFont(ofSize: 12)
+        label.translatesAutoresizingMaskIntoConstraints = false
+
+        languagePopup.removeAllItems()
+        for language in AppLanguage.allCases {
+            languagePopup.addItem(withTitle: language.menuTitle)
+            languagePopup.lastItem?.representedObject = language.rawValue
+        }
+        languagePopup.selectItem(where: { ($0.representedObject as? String) == AppLanguage.selected.rawValue })
+        languagePopup.target = self
+        languagePopup.action = #selector(languageSelectionChanged)
+        languagePopup.controlSize = .small
+        languagePopup.translatesAutoresizingMaskIntoConstraints = false
+
+        row.addSubview(label)
+        row.addSubview(languagePopup)
+        NSLayoutConstraint.activate([
+            label.leadingAnchor.constraint(equalTo: row.leadingAnchor),
+            label.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+            languagePopup.trailingAnchor.constraint(equalTo: row.trailingAnchor),
+            languagePopup.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+            languagePopup.widthAnchor.constraint(equalToConstant: 138)
+        ])
+        return row
+    }
+
     private func makeFooter() -> NSView {
         let row = NSView()
         row.translatesAutoresizingMaskIntoConstraints = false
         row.heightAnchor.constraint(equalToConstant: 30).isActive = true
         row.widthAnchor.constraint(equalToConstant: 298).isActive = true
-        let refresh = NSButton(title: "Refresh now", target: self, action: #selector(refreshNow))
-        let quit = NSButton(title: "Quit MacBuddy", target: self, action: #selector(quitMacBuddy))
+        let refresh = NSButton(title: tr("Refresh now", "지금 새로고침"), target: self, action: #selector(refreshNow))
+        let quit = NSButton(title: tr("Quit MacBuddy", "MacBuddy 종료"), target: self, action: #selector(quitMacBuddy))
         refresh.controlSize = .small
         quit.controlSize = .small
         refresh.translatesAutoresizingMaskIntoConstraints = false
@@ -395,6 +436,79 @@ private final class DashboardViewController: NSViewController {
         rule.widthAnchor.constraint(equalToConstant: 298).isActive = true
         rule.heightAnchor.constraint(equalToConstant: 1).isActive = true
         return rule
+    }
+}
+
+@MainActor
+private final class ProcessRowView: NSView {
+    private let icon = NSImageView(
+        image: NSImage(systemSymbolName: "bolt.circle", accessibilityDescription: nil) ?? NSImage()
+    )
+    private let nameLabel = NSTextField(labelWithString: "")
+    private let detailLabel = NSTextField(labelWithString: "")
+    private let quitButton: NSButton
+
+    init(target: AnyObject?, action: Selector) {
+        quitButton = NSButton(title: "", target: target, action: action)
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        heightAnchor.constraint(equalToConstant: 24).isActive = true
+        widthAnchor.constraint(equalToConstant: 298).isActive = true
+
+        icon.translatesAutoresizingMaskIntoConstraints = false
+        nameLabel.font = .systemFont(ofSize: 10.5)
+        nameLabel.lineBreakMode = .byTruncatingTail
+        nameLabel.translatesAutoresizingMaskIntoConstraints = false
+        detailLabel.font = .monospacedDigitSystemFont(ofSize: 9.5, weight: .regular)
+        detailLabel.textColor = .secondaryLabelColor
+        detailLabel.translatesAutoresizingMaskIntoConstraints = false
+        quitButton.controlSize = .small
+        quitButton.bezelStyle = .rounded
+        quitButton.translatesAutoresizingMaskIntoConstraints = false
+
+        addSubview(icon)
+        addSubview(nameLabel)
+        addSubview(detailLabel)
+        addSubview(quitButton)
+        NSLayoutConstraint.activate([
+            icon.leadingAnchor.constraint(equalTo: leadingAnchor),
+            icon.centerYAnchor.constraint(equalTo: centerYAnchor),
+            icon.widthAnchor.constraint(equalToConstant: 14),
+            icon.heightAnchor.constraint(equalToConstant: 14),
+            nameLabel.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 6),
+            nameLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
+            detailLabel.leadingAnchor.constraint(greaterThanOrEqualTo: nameLabel.trailingAnchor, constant: 5),
+            detailLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
+            quitButton.leadingAnchor.constraint(equalTo: detailLabel.trailingAnchor, constant: 6),
+            quitButton.trailingAnchor.constraint(equalTo: trailingAnchor),
+            quitButton.centerYAnchor.constraint(equalTo: centerYAnchor),
+            nameLabel.widthAnchor.constraint(lessThanOrEqualToConstant: 100)
+        ])
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    func configure(process: ProcessSnapshot?, tintColor: NSColor) {
+        guard let process else {
+            isHidden = true
+            return
+        }
+
+        isHidden = false
+        icon.contentTintColor = tintColor
+        nameLabel.stringValue = process.name
+        detailLabel.stringValue = String(format: "%.0f MB · %.0f%% ~1m", process.memoryMB, process.cpu)
+        quitButton.title = tr("Quit", "종료")
+        quitButton.tag = Int(process.id)
+        quitButton.isEnabled = process.isRegularApplication && !process.isProtected
+        quitButton.toolTip = quitButton.isEnabled
+            ? nil
+            : tr(
+                "Protected or ambiguous app instance",
+                "보호된 앱 또는 구분할 수 없는 앱 인스턴스"
+            )
     }
 }
 
@@ -442,5 +556,16 @@ private final class MetricRowView: NSView {
     func set(value: String, detail: String) {
         valueLabel.stringValue = value
         detailLabel.stringValue = detail
+    }
+
+    func setTitle(_ title: String) {
+        titleLabel.stringValue = title
+    }
+}
+
+private extension NSPopUpButton {
+    func selectItem(where predicate: (NSMenuItem) -> Bool) {
+        guard let item = itemArray.first(where: predicate) else { return }
+        select(item)
     }
 }

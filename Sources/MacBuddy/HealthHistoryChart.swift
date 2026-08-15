@@ -15,12 +15,20 @@ final class HealthHistoryChartView: NSView {
         let captionFont = NSFont.systemFont(ofSize: 10)
         let secondary = NSColor.secondaryLabelColor
 
-        ("Recent trend" as NSString).draw(
+        (tr("Recent trend", "최근 추이") as NSString).draw(
             at: NSPoint(x: 0, y: 0),
             withAttributes: [.font: titleFont, .foregroundColor: NSColor.labelColor]
         )
-        let minutes = max(samples.count * 12 / 60, 1)
-        let duration = "last \(minutes)m" as NSString
+        let elapsed = max(samples.last?.timestamp.timeIntervalSince(samples.first?.timestamp ?? .now) ?? 0, 0)
+        let durationText: String
+        if elapsed < 60 {
+            let seconds = max(Int(elapsed.rounded()), 1)
+            durationText = tr("last \(seconds)s", "최근 \(seconds)초")
+        } else {
+            let minutes = max(Int((elapsed / 60).rounded()), 1)
+            durationText = tr("last \(minutes)m", "최근 \(minutes)분")
+        }
+        let duration = durationText as NSString
         let durationSize = duration.size(withAttributes: [.font: captionFont])
         duration.draw(
             at: NSPoint(x: bounds.maxX - durationSize.width, y: 2),
@@ -40,12 +48,12 @@ final class HealthHistoryChartView: NSView {
             line.stroke()
         }
 
-        let points = Array(samples.suffix(150))
+        let points = Array(samples.suffix(450))
         drawTrend(points, in: chart, color: .systemMint) { $0.memoryFraction }
-        drawTrend(points, in: chart, color: .systemOrange) { $0.cpuLoad / 10 }
+        drawTrend(points, in: chart, color: .systemOrange) { $0.cpuUsageFraction }
 
-        drawLegend(color: .systemMint, text: "Memory pressure", x: 0, y: 106, font: captionFont)
-        drawLegend(color: .systemOrange, text: "CPU load", x: 102, y: 106, font: captionFont)
+        drawLegend(color: .systemMint, text: tr("Memory pressure", "메모리 압력"), x: 0, y: 106, font: captionFont)
+        drawLegend(color: .systemOrange, text: tr("CPU usage", "CPU 사용률"), x: 102, y: 106, font: captionFont)
 
         let hint = monitoringHint as NSString
         let hintSize = hint.size(withAttributes: [.font: captionFont])
@@ -62,13 +70,21 @@ final class HealthHistoryChartView: NSView {
         value: (HealthSample) -> Double
     ) {
         guard points.count > 1 else { return }
+        guard let firstTimestamp = points.first?.timestamp,
+              let lastTimestamp = points.last?.timestamp
+        else { return }
+        let elapsed = max(lastTimestamp.timeIntervalSince(firstTimestamp), 0.001)
         let path = NSBezierPath()
-        for (index, point) in points.enumerated() {
-            let x = rect.minX + rect.width * CGFloat(index) / CGFloat(points.count - 1)
+        var previousTimestamp: Date?
+        for point in points {
+            let timeFraction = point.timestamp.timeIntervalSince(firstTimestamp) / elapsed
+            let x = rect.minX + rect.width * CGFloat(min(max(timeFraction, 0), 1))
             let normalized = min(max(value(point), 0), 1)
             let y = rect.maxY - rect.height * normalized
-            if index == 0 { path.move(to: NSPoint(x: x, y: y)) }
+            let hasGap = previousTimestamp.map { point.timestamp.timeIntervalSince($0) > 8 } ?? true
+            if hasGap { path.move(to: NSPoint(x: x, y: y)) }
             else { path.line(to: NSPoint(x: x, y: y)) }
+            previousTimestamp = point.timestamp
         }
         color.setStroke()
         path.lineWidth = 2.5
@@ -89,9 +105,9 @@ final class HealthHistoryChartView: NSView {
     private var monitoringHint: String {
         guard let latest = samples.last else { return "" }
         switch latest.status {
-        case .calm: return "steady"
-        case .busy: return "watching"
-        case .strained: return "needs attention"
+        case .calm: return tr("steady", "안정")
+        case .busy: return tr("watching", "관찰 중")
+        case .strained: return tr("needs attention", "확인 필요")
         }
     }
 }
