@@ -3,14 +3,18 @@ import AppKit
 @MainActor
 final class MascotWindowController: NSObject {
     private let monitor: SystemMonitor
+    private let checkForUpdates: () -> Void
     private var panel: NSPanel?
     private var mascotView: MascotCanvasView?
     private let panelSize = NSSize(width: 156, height: 238)
+    private var sessionActive = true
+    private var screensAwake = true
 
     var isVisible: Bool { panel?.isVisible == true }
 
-    init(monitor: SystemMonitor) {
+    init(monitor: SystemMonitor, checkForUpdates: @escaping () -> Void) {
         self.monitor = monitor
+        self.checkForUpdates = checkForUpdates
         super.init()
         NotificationCenter.default.addObserver(
             self,
@@ -18,12 +22,44 @@ final class MascotWindowController: NSObject {
             name: .systemMonitorDidUpdate,
             object: monitor
         )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(languageDidChange),
+            name: .appLanguageDidChange,
+            object: nil
+        )
+        let workspaceCenter = NSWorkspace.shared.notificationCenter
+        workspaceCenter.addObserver(
+            self,
+            selector: #selector(sessionDidResignActive),
+            name: NSWorkspace.sessionDidResignActiveNotification,
+            object: nil
+        )
+        workspaceCenter.addObserver(
+            self,
+            selector: #selector(sessionDidBecomeActive),
+            name: NSWorkspace.sessionDidBecomeActiveNotification,
+            object: nil
+        )
+        workspaceCenter.addObserver(
+            self,
+            selector: #selector(screensDidSleep),
+            name: NSWorkspace.screensDidSleepNotification,
+            object: nil
+        )
+        workspaceCenter.addObserver(
+            self,
+            selector: #selector(screensDidWake),
+            name: NSWorkspace.screensDidWakeNotification,
+            object: nil
+        )
     }
 
     func show() {
         if let panel {
-            mascotView?.startAnimation()
             panel.orderFrontRegardless()
+            updateAnimationState()
+            DispatchQueue.main.async { [weak self] in self?.updateAnimationState() }
             return
         }
 
@@ -42,7 +78,11 @@ final class MascotWindowController: NSObject {
         panel.hidesOnDeactivate = false
         panel.isMovableByWindowBackground = false
 
-        let mascotView = MascotCanvasView(frame: NSRect(origin: .zero, size: panelSize), monitor: monitor)
+        let mascotView = MascotCanvasView(
+            frame: NSRect(origin: .zero, size: panelSize),
+            monitor: monitor,
+            checkForUpdates: checkForUpdates
+        )
         panel.contentView = mascotView
 
         if let screen = NSScreen.main {
@@ -52,23 +92,71 @@ final class MascotWindowController: NSObject {
 
         self.panel = panel
         self.mascotView = mascotView
-        mascotView.startAnimation()
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(windowOcclusionDidChange),
+            name: NSWindow.didChangeOcclusionStateNotification,
+            object: panel
+        )
         panel.orderFrontRegardless()
+        updateAnimationState()
+        DispatchQueue.main.async { [weak self] in self?.updateAnimationState() }
     }
 
     func hide() {
-        mascotView?.stopAnimation()
         panel?.orderOut(nil)
+        updateAnimationState()
     }
 
     @objc private func monitorDidUpdate() {
         mascotView?.refreshStatus()
+    }
+
+    @objc private func languageDidChange() {
+        mascotView?.refreshStatus(forceText: true)
+    }
+
+    @objc private func sessionDidResignActive() {
+        sessionActive = false
+        updateAnimationState()
+    }
+
+    @objc private func sessionDidBecomeActive() {
+        sessionActive = true
+        updateAnimationState()
+    }
+
+    @objc private func screensDidSleep() {
+        screensAwake = false
+        updateAnimationState()
+    }
+
+    @objc private func screensDidWake() {
+        screensAwake = true
+        updateAnimationState()
+    }
+
+    @objc private func windowOcclusionDidChange() {
+        updateAnimationState()
+    }
+
+    private func updateAnimationState() {
+        guard let panel, panel.isVisible,
+              panel.occlusionState.contains(.visible),
+              sessionActive,
+              screensAwake
+        else {
+            mascotView?.stopAnimation()
+            return
+        }
+        mascotView?.startAnimation()
     }
 }
 
 @MainActor
 private final class MascotCanvasView: NSView {
     private let monitor: SystemMonitor
+    private let checkForUpdates: () -> Void
     private var character = CharacterKind.selected
     private var spritePack: SpriteFramePack
     private var expanded = false
@@ -83,6 +171,31 @@ private final class MascotCanvasView: NSView {
     private var animationTimer: Timer?
     private var blinkEndTimer: Timer?
     private var optimizationWindow: MemoryOptimizationWindowController?
+    private var lastRenderedStatus: HealthStatus?
+    private var lastRenderedEnergySegments: Int?
+    private var lastRenderedMessage: String?
+
+    private static let bubbleDrawRect = NSRect(x: 8, y: 56, width: 140, height: 60)
+    private static let energyDrawRect = NSRect(x: 53, y: 118, width: 50, height: 13)
+    private static let mascotDrawRect = NSRect(x: 32, y: 133, width: 92, height: 96)
+    private let messageBubblePath = NSBezierPath(
+        roundedRect: NSRect(x: 10, y: 58, width: 136, height: 56),
+        xRadius: 14,
+        yRadius: 14
+    )
+    private let energyOutlinePath = NSBezierPath(
+        rect: NSRect(x: 55, y: 120, width: 46, height: 9).insetBy(dx: 0.5, dy: 0.5)
+    )
+    private lazy var messageAttributes: [NSAttributedString.Key: Any] = {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = .center
+        paragraph.lineSpacing = 2
+        return [
+            .font: NSFont.monospacedSystemFont(ofSize: 13, weight: .medium),
+            .foregroundColor: NSColor.white,
+            .paragraphStyle: paragraph
+        ]
+    }()
 
     private var startMouse = NSPoint.zero
     private var lastMouse = NSPoint.zero
@@ -92,16 +205,17 @@ private final class MascotCanvasView: NSView {
 
     override var isFlipped: Bool { true }
 
-    init(frame frameRect: NSRect, monitor: SystemMonitor) {
+    init(frame frameRect: NSRect, monitor: SystemMonitor, checkForUpdates: @escaping () -> Void) {
         self.monitor = monitor
+        self.checkForUpdates = checkForUpdates
         self.spritePack = SpriteFramePack(kind: CharacterKind.selected)
         super.init(frame: frameRect)
-        wantsLayer = true
-        layer?.backgroundColor = NSColor.clear.cgColor
-        layer?.magnificationFilter = .nearest
         setAccessibilityElement(true)
         setAccessibilityRole(.button)
         updateAccessibility()
+        lastRenderedStatus = monitor.status
+        lastRenderedEnergySegments = energySegments
+        lastRenderedMessage = message
     }
 
     required init?(coder: NSCoder) {
@@ -126,17 +240,18 @@ private final class MascotCanvasView: NSView {
         NSGraphicsContext.saveGraphicsState()
         NSGraphicsContext.current?.compositingOperation = .copy
         NSColor.clear.setFill()
-        bounds.fill()
+        dirtyRect.fill()
         NSGraphicsContext.restoreGraphicsState()
 
-        if expanded { drawMessageBubble() }
-        drawEnergyBar()
-        drawMascot()
+        if expanded, dirtyRect.intersects(Self.bubbleDrawRect) { drawMessageBubble() }
+        if dirtyRect.intersects(Self.energyDrawRect) { drawEnergyBar() }
+        if dirtyRect.intersects(Self.mascotDrawRect) { drawMascot() }
     }
 
     func startAnimation() {
         guard animationTimer == nil else { return }
         let timer = Timer(timeInterval: 0.52, target: self, selector: #selector(advanceIdleAnimation), userInfo: nil, repeats: true)
+        timer.tolerance = 0.08
         RunLoop.main.add(timer, forMode: .common)
         animationTimer = timer
     }
@@ -148,20 +263,36 @@ private final class MascotCanvasView: NSView {
         blinkEndTimer = nil
     }
 
-    func refreshStatus() {
-        updateAccessibility()
-        needsDisplay = true
+    func refreshStatus(forceText: Bool = false) {
+        let currentStatus = monitor.status
+        let currentSegments = energySegments
+        let currentMessage = message
+        let statusChanged = currentStatus != lastRenderedStatus
+
+        if forceText || statusChanged {
+            updateAccessibility()
+        }
+        if statusChanged || currentSegments != lastRenderedEnergySegments {
+            setNeedsDisplay(Self.energyDrawRect)
+        }
+        if expanded, forceText || currentMessage != lastRenderedMessage {
+            setNeedsDisplay(Self.bubbleDrawRect)
+        }
+
+        lastRenderedStatus = currentStatus
+        lastRenderedEnergySegments = currentSegments
+        lastRenderedMessage = currentMessage
     }
 
     override func mouseEntered(with event: NSEvent) {
         hovering = true
         animationTick = 0
-        needsDisplay = true
+        setNeedsDisplay(Self.mascotDrawRect)
     }
 
     override func mouseExited(with event: NSEvent) {
         hovering = false
-        needsDisplay = true
+        setNeedsDisplay(Self.mascotDrawRect)
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -196,7 +327,7 @@ private final class MascotCanvasView: NSView {
             strideDistance = 0
         }
         lastMouse = current
-        needsDisplay = true
+        setNeedsDisplay(Self.mascotDrawRect)
     }
 
     override func mouseUp(with event: NSEvent) {
@@ -205,16 +336,18 @@ private final class MascotCanvasView: NSView {
             facing = .front
             verticalMotion = .idle
             step = false
+            setNeedsDisplay(Self.mascotDrawRect)
         } else {
             expanded.toggle()
+            setNeedsDisplay(Self.bubbleDrawRect)
         }
-        needsDisplay = true
     }
 
     override func rightMouseDown(with event: NSEvent) {
         let menu = NSMenu()
-        let characterItem = NSMenuItem(title: "Character", action: nil, keyEquivalent: "")
-        let characterMenu = NSMenu(title: "Character")
+        let characterTitle = tr("Character", "캐릭터")
+        let characterItem = NSMenuItem(title: characterTitle, action: nil, keyEquivalent: "")
+        let characterMenu = NSMenu(title: characterTitle)
 
         for kind in CharacterKind.allCases {
             let item = NSMenuItem(title: kind.displayName, action: #selector(selectCharacter(_:)), keyEquivalent: "")
@@ -225,14 +358,31 @@ private final class MascotCanvasView: NSView {
         }
         characterItem.submenu = characterMenu
         menu.addItem(characterItem)
+
+        let languageTitle = tr("Language", "언어")
+        let languageItem = NSMenuItem(title: languageTitle, action: nil, keyEquivalent: "")
+        let languageMenu = NSMenu(title: languageTitle)
+        for language in AppLanguage.allCases {
+            let item = NSMenuItem(title: language.menuTitle, action: #selector(selectLanguage(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = language.rawValue
+            item.state = language == AppLanguage.selected ? .on : .off
+            languageMenu.addItem(item)
+        }
+        languageItem.submenu = languageMenu
+        menu.addItem(languageItem)
         menu.addItem(.separator())
 
-        let optimize = NSMenuItem(title: "Optimize Memory…", action: #selector(showMemoryOptimization), keyEquivalent: "")
+        let optimize = NSMenuItem(title: tr("Optimize Memory…", "메모리 최적화…"), action: #selector(showMemoryOptimization), keyEquivalent: "")
         optimize.target = self
         menu.addItem(optimize)
+
+        let updates = NSMenuItem(title: tr("Check for Updates…", "업데이트 확인…"), action: #selector(checkForUpdatesNow), keyEquivalent: "")
+        updates.target = self
+        menu.addItem(updates)
         menu.addItem(.separator())
 
-        let about = NSMenuItem(title: "About MacBuddy…", action: #selector(showAboutPanel), keyEquivalent: "")
+        let about = NSMenuItem(title: tr("About MacBuddy…", "MacBuddy 정보…"), action: #selector(showAboutPanel), keyEquivalent: "")
         about.target = self
         menu.addItem(about)
         NSMenu.popUpContextMenu(menu, with: event, for: self)
@@ -250,18 +400,25 @@ private final class MascotCanvasView: NSView {
         blink = false
         step = false
         facing = .front
-        needsDisplay = true
+        setNeedsDisplay(Self.mascotDrawRect)
         updateAccessibility()
+    }
+
+    @objc private func selectLanguage(_ sender: NSMenuItem) {
+        guard let rawValue = sender.representedObject as? String,
+              let language = AppLanguage(rawValue: rawValue)
+        else { return }
+        language.select()
     }
 
     @objc private func showAboutPanel() {
         let options: [NSApplication.AboutPanelOptionKey: Any] = [
             .applicationName: "MacBuddy",
             .applicationVersion: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.1",
-            .version: "Build \(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "1")",
+            .version: "\(tr("Build", "빌드")) \(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "1")",
             .applicationIcon: spritePack.icon(),
             .credits: NSAttributedString(
-                string: "Created by Jaeyong Park\n\nA tiny pixel companion for macOS system health.",
+                string: "Created by Jaeyong Park\nA tiny pixel companion for your Mac.",
                 attributes: [.foregroundColor: NSColor.secondaryLabelColor]
             )
         ]
@@ -278,6 +435,10 @@ private final class MascotCanvasView: NSView {
         optimizationWindow?.present()
     }
 
+    @objc private func checkForUpdatesNow() {
+        checkForUpdates()
+    }
+
     @objc private func advanceIdleAnimation() {
         guard !dragging else { return }
         animationTick += 1
@@ -289,33 +450,24 @@ private final class MascotCanvasView: NSView {
             blink = true
             blinkEndTimer?.invalidate()
             let timer = Timer(timeInterval: 0.14, target: self, selector: #selector(endBlink), userInfo: nil, repeats: false)
+            timer.tolerance = 0.02
             RunLoop.main.add(timer, forMode: .common)
             blinkEndTimer = timer
         }
 
-        if !reduceMotion || blink { needsDisplay = true }
+        if !reduceMotion || blink { setNeedsDisplay(Self.mascotDrawRect) }
     }
 
     @objc private func endBlink() {
         blink = false
-        needsDisplay = true
+        setNeedsDisplay(Self.mascotDrawRect)
     }
 
     private func drawMessageBubble() {
-        let rect = NSRect(x: 10, y: 58, width: 136, height: 56)
         NSColor.black.withAlphaComponent(0.76).setFill()
-        NSBezierPath(roundedRect: rect, xRadius: 14, yRadius: 14).fill()
-
-        let paragraph = NSMutableParagraphStyle()
-        paragraph.alignment = .center
-        paragraph.lineSpacing = 2
-        let attributes: [NSAttributedString.Key: Any] = [
-            .font: NSFont.monospacedSystemFont(ofSize: 13, weight: .medium),
-            .foregroundColor: NSColor.white,
-            .paragraphStyle: paragraph
-        ]
+        messageBubblePath.fill()
         let textRect = NSRect(x: 16, y: 67, width: 124, height: 40)
-        (message as NSString).draw(with: textRect, options: [.usesLineFragmentOrigin], attributes: attributes)
+        (message as NSString).draw(with: textRect, options: [.usesLineFragmentOrigin], attributes: messageAttributes)
     }
 
     private func drawEnergyBar() {
@@ -323,11 +475,10 @@ private final class MascotCanvasView: NSView {
         NSColor(calibratedRed: 0.03, green: 0.06, blue: 0.14, alpha: 0.92).setFill()
         outer.fill()
         monitor.energyColor.withAlphaComponent(0.45).setStroke()
-        let outline = NSBezierPath(rect: outer.insetBy(dx: 0.5, dy: 0.5))
-        outline.lineWidth = 1
-        outline.stroke()
+        energyOutlinePath.lineWidth = 1
+        energyOutlinePath.stroke()
 
-        let filled = max(1, min(6, Int((monitor.energyLevel * 6).rounded(.up))))
+        let filled = energySegments
         for index in 0..<6 {
             let segment = NSRect(x: 57 + CGFloat(index * 7), y: 122.5, width: 6, height: 4)
             (index < filled ? monitor.energyColor : NSColor.white.withAlphaComponent(0.14)).setFill()
@@ -365,15 +516,26 @@ private final class MascotCanvasView: NSView {
 
     private var message: String {
         switch monitor.status {
-        case .calm: "여유 있어\n\(monitor.memorySummary)"
-        case .busy: "조금 무거워\n메뉴에서 앱 확인"
-        case .strained: "정리가 필요해\n무거운 앱 확인"
+        case .calm: tr("All clear\n\(monitor.memorySummary)", "여유 있어\n\(monitor.memorySummary)")
+        case .busy, .strained:
+            switch monitor.dominantLoadCause {
+            case .cpu: tr("CPU load high\nMemory is okay", "CPU 사용량 높음\n메모리는 여유 있어")
+            case .memory: tr("Memory pressure\nCheck heavy apps", "메모리 압력 높음\n무거운 앱 확인")
+            case .both: tr("System load high\nCPU + memory", "시스템 부하 높음\nCPU + 메모리")
+            }
         }
+    }
+
+    private var energySegments: Int {
+        SystemHealthPolicy.energySegments(for: monitor.energyLevel)
     }
 
     private func updateAccessibility() {
         setAccessibilityLabel("MacBuddy \(character.displayName), \(monitor.statusTitle)")
-        setAccessibilityHelp("Click for status. Drag to move. Right-click to choose a character.")
+        setAccessibilityHelp(tr(
+            "Click for status. Drag to move. Right-click for options.",
+            "클릭하면 상태를 보고, 드래그하면 옮길 수 있습니다. 우클릭하면 옵션이 열립니다."
+        ))
     }
 
     private enum VerticalMotion {

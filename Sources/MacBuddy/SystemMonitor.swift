@@ -1,5 +1,6 @@
 import AppKit
 import Darwin
+import Dispatch
 import Foundation
 import MachO
 import UserNotifications
@@ -20,45 +21,91 @@ struct ProcessSnapshot: Sendable {
 }
 
 struct MemoryHealthSnapshot: Sendable {
-    let availableGB: Double
-    let pressureFreePercent: Double
+    let headroomGB: Double
+    let headroomPercent: Double
+    let pressure: MemoryPressureState
     let swapGB: Double
 }
 
 struct HealthSample: Sendable {
     let timestamp: Date
     let memoryFraction: Double
-    let cpuLoad: Double
+    let cpuUsageFraction: Double
     let status: HealthStatus
+}
+
+enum SystemLoadCause: Sendable {
+    case memory, cpu, both
+}
+
+enum MemoryPressureState: Equatable, Sendable {
+    case normal, warning, critical, unknown
+
+    var healthStatus: HealthStatus {
+        switch self {
+        case .normal, .unknown: .calm
+        case .warning: .busy
+        case .critical: .strained
+        }
+    }
+
+    var title: String {
+        switch self {
+        case .normal: tr("normal", "정상")
+        case .warning: tr("warning", "경고")
+        case .critical: tr("critical", "위험")
+        case .unknown: tr("unknown", "확인 중")
+        }
+    }
 }
 
 @MainActor
 final class SystemMonitor: NSObject {
     private(set) var totalMemoryGB = 0.0
-    private(set) var availableMemoryGB = 0.0
-    private(set) var memoryPressureFreePercent = 0.0
+    private(set) var memoryHeadroomGB = 0.0
+    private(set) var memoryHeadroomPercent = 0.0
+    private(set) var memoryPressureState = MemoryPressureState.unknown
     private(set) var swapGB = 0.0
-    private(set) var cpuLoad = 0.0
+    private(set) var cpuUsagePercent = 0.0
     private(set) var freeDiskGB = 0.0
     private(set) var topProcesses: [ProcessSnapshot] = []
     private(set) var alertsEnabled = UserDefaults.standard.bool(forKey: "alertsEnabled")
     private(set) var history: [HealthSample] = []
 
-    private var timer: Timer?
+    private var memoryTimer: Timer?
+    private var cpuTimer: Timer?
+    private var memoryPressureSource: (any DispatchSourceMemoryPressure)?
+    private var previousCPUTicks: SystemMetrics.CPUTicks?
+    private var cpuStatusTracker = CPUStatusTracker()
     private var dashboardVisible = false
     private var lastProcessCollection = Date.distantPast
     private var lastExternalFrontmostPID: Int32?
+    private var processCollectionInFlight = false
+    private var processCollectionPending = false
+    private var lastStrainedNotification = Date.distantPast
+
+    private var cpuStatus: HealthStatus { cpuStatusTracker.status }
 
     var memoryFraction: Double {
-        guard memoryPressureFreePercent > 0 else { return 0 }
-        return min(max(1 - memoryPressureFreePercent / 100, 0), 1)
+        guard totalMemoryGB > 0 else { return 0 }
+        return SystemHealthPolicy.memoryLoadFraction(
+            headroomPercent: memoryHeadroomPercent,
+            pressure: memoryPressureState
+        )
+    }
+
+    var cpuUsageFraction: Double {
+        min(max(cpuUsagePercent / 100, 0), 1)
     }
 
     var status: HealthStatus {
-        let cores = Double(ProcessInfo.processInfo.activeProcessorCount)
-        if (memoryPressureFreePercent < 10 && swapGB > 2) || cpuLoad > cores * 0.9 { return .strained }
-        if (memoryPressureFreePercent < 25 && swapGB > 0.5) || cpuLoad > cores * 0.55 { return .busy }
-        return .calm
+        HealthStatus.maximum(memoryPressureState.healthStatus, cpuStatus)
+    }
+
+    var dominantLoadCause: SystemLoadCause {
+        let difference = memoryFraction - cpuUsageFraction
+        if abs(difference) <= 0.10 { return .both }
+        return difference > 0 ? .memory : .cpu
     }
 
     var statusTitle: String { status.title }
@@ -66,15 +113,19 @@ final class SystemMonitor: NSObject {
     var energyColor: NSColor { status.energyColor }
     var statusSymbol: String { status.symbol }
     var energyLevel: Double {
-        let memoryHeadroom = memoryPressureFreePercent > 0 ? memoryPressureFreePercent / 100 : 1
-        let cpuHeadroom = max(0, 1 - cpuLoad / (Double(ProcessInfo.processInfo.activeProcessorCount) * 0.9))
-        return min(max(min(memoryHeadroom, cpuHeadroom), 0), 1)
+        max(memoryFraction, cpuUsageFraction)
     }
-    var memorySummary: String { "\(availableMemoryGB.oneDecimal) GB 가용" }
-    var memorySummaryEnglish: String { "\(availableMemoryGB.oneDecimal) GB available" }
-    var memoryDetail: String { "macOS pressure \(memoryPressureFreePercent.rounded())% free · \(swapGB.oneDecimal) GB swap" }
-    var cpuSummary: String { String(format: "%.2f", cpuLoad) }
-    var diskSummary: String { "\(freeDiskGB.oneDecimal) GB free" }
+    var memorySummary: String {
+        tr("\(memoryHeadroomGB.oneDecimal) GB headroom est.", "\(memoryHeadroomGB.oneDecimal) GB 여유 추정")
+    }
+    var memoryDetail: String {
+        tr(
+            "Pressure \(memoryPressureState.title) · headroom est. \(Int(memoryHeadroomPercent.rounded()))% · \(swapGB.oneDecimal) GB swap",
+            "압력 \(memoryPressureState.title) · 여유 추정 \(Int(memoryHeadroomPercent.rounded()))% · swap \(swapGB.oneDecimal) GB"
+        )
+    }
+    var cpuSummary: String { String(format: "%.0f%%", cpuUsagePercent) }
+    var diskSummary: String { tr("\(freeDiskGB.oneDecimal) GB free", "\(freeDiskGB.oneDecimal) GB 여유") }
     var optimizationCandidates: [ProcessSnapshot] {
         var seen = Set<String>()
         return topProcesses.filter { process in
@@ -86,18 +137,29 @@ final class SystemMonitor: NSObject {
 
     var memoryHealthSnapshot: MemoryHealthSnapshot {
         MemoryHealthSnapshot(
-            availableGB: availableMemoryGB,
-            pressureFreePercent: memoryPressureFreePercent,
+            headroomGB: memoryHeadroomGB,
+            headroomPercent: memoryHeadroomPercent,
+            pressure: memoryPressureState,
             swapGB: swapGB
         )
     }
 
     func start() {
-        guard timer == nil else { return }
+        guard memoryTimer == nil, cpuTimer == nil else { return }
+        installWorkspaceObservers()
+        startMemoryPressureMonitoring()
+        previousCPUTicks = SystemMetrics.cpuTicks()
         if history.isEmpty { refresh() }
-        let timer = Timer(timeInterval: 12, target: self, selector: #selector(timerFired), userInfo: nil, repeats: true)
-        RunLoop.main.add(timer, forMode: .common)
-        self.timer = timer
+
+        let memoryTimer = Timer(timeInterval: 12, target: self, selector: #selector(memoryTimerFired), userInfo: nil, repeats: true)
+        memoryTimer.tolerance = 1.2
+        RunLoop.main.add(memoryTimer, forMode: .common)
+        self.memoryTimer = memoryTimer
+
+        let cpuTimer = Timer(timeInterval: 2, target: self, selector: #selector(cpuTimerFired), userInfo: nil, repeats: true)
+        cpuTimer.tolerance = 0.2
+        RunLoop.main.add(cpuTimer, forMode: .common)
+        self.cpuTimer = cpuTimer
     }
 
     func dashboardOpened() {
@@ -119,44 +181,25 @@ final class SystemMonitor: NSObject {
         let previousStatus = status
         let memory = SystemMetrics.memory()
         totalMemoryGB = memory.totalGB
-        availableMemoryGB = memory.availableGB
-        memoryPressureFreePercent = memory.pressureFreePercent
+        memoryHeadroomGB = memory.headroomGB
+        memoryHeadroomPercent = memory.headroomPercent
+        memoryPressureState = memory.pressure
         swapGB = memory.swapGB
-        cpuLoad = SystemMetrics.cpuLoad()
         freeDiskGB = SystemMetrics.freeDiskGB()
 
         let currentStatus = status
-        history.append(HealthSample(
-            timestamp: .now,
-            memoryFraction: memoryFraction,
-            cpuLoad: cpuLoad,
-            status: currentStatus
-        ))
-        if history.count > 150 { history.removeFirst(history.count - 150) }
+        publishUpdate(previousStatus: previousStatus, recordSample: history.isEmpty)
 
-        if alertsEnabled, currentStatus == .strained, previousStatus != .strained {
-            NotificationManager.sendStrainedNotification(memory: memorySummary, cpu: cpuSummary)
-        }
-
-        postUpdate()
-
-        let processInterval: TimeInterval = currentStatus == .calm ? 30 : 12
         let elapsed = Date.now.timeIntervalSince(lastProcessCollection)
-        let shouldCollect = forceProcessList ||
-            (dashboardVisible && elapsed >= processInterval) ||
-            (currentStatus != .calm && elapsed >= processInterval)
+        let shouldCollect = SystemHealthPolicy.shouldCollectProcesses(
+            force: forceProcessList,
+            dashboardVisible: dashboardVisible,
+            status: currentStatus,
+            elapsed: elapsed
+        )
         guard shouldCollect else { return }
 
-        lastProcessCollection = .now
-        let protectedFrontmostPID = lastExternalFrontmostPID
-        Task { [weak self] in
-            let processes = await Task.detached(priority: .utility) {
-                SystemMetrics.topProcesses()
-            }.value
-            guard let self else { return }
-            self.topProcesses = self.decorate(processes, protectedFrontmostPID: protectedFrontmostPID)
-            self.postUpdate()
-        }
+        requestProcessCollection(protectedFrontmostPID: lastExternalFrontmostPID)
     }
 
     func setAlertsEnabled(_ enabled: Bool) {
@@ -178,18 +221,152 @@ final class SystemMonitor: NSObject {
 
     @discardableResult
     func quit(_ process: ProcessSnapshot) -> Bool {
-        guard process.id != ProcessInfo.processInfo.processIdentifier,
-              let application = NSRunningApplication(processIdentifier: process.id)
+        let ownPID = Int32(ProcessInfo.processInfo.processIdentifier)
+        guard !process.isProtected,
+              process.isRegularApplication,
+              process.id != ownPID,
+              let expectedBundlePath = process.bundlePath,
+              let expectedBundleIdentifier = process.bundleIdentifier,
+              let application = NSRunningApplication(processIdentifier: process.id),
+              !application.isTerminated,
+              application.activationPolicy == .regular,
+              application.bundleIdentifier == expectedBundleIdentifier,
+              application.bundleURL?.standardizedFileURL.path == expectedBundlePath
         else { return false }
         return application.terminate()
     }
 
-    @objc private func timerFired() {
+    @objc private func memoryTimerFired() {
         refresh()
+    }
+
+    @objc private func cpuTimerFired() {
+        guard let currentTicks = SystemMetrics.cpuTicks() else { return }
+        defer { previousCPUTicks = currentTicks }
+        guard let previousCPUTicks else { return }
+
+        let previousStatus = status
+        let currentUsage = SystemMetrics.cpuUsagePercent(from: previousCPUTicks, to: currentTicks)
+        cpuUsagePercent = cpuUsagePercent > 0
+            ? cpuUsagePercent * 0.35 + currentUsage * 0.65
+            : currentUsage
+        cpuStatusTracker.update(usagePercent: cpuUsagePercent)
+        publishUpdate(previousStatus: previousStatus, recordSample: true)
+    }
+
+    @objc private func systemWillSleep() {
+        previousCPUTicks = nil
+    }
+
+    @objc private func systemDidWake() {
+        previousCPUTicks = SystemMetrics.cpuTicks()
+        cpuUsagePercent = 0
+        cpuStatusTracker.reset()
+        refresh(forceProcessList: dashboardVisible)
+    }
+
+    private func installWorkspaceObservers() {
+        let center = NSWorkspace.shared.notificationCenter
+        center.addObserver(self, selector: #selector(systemWillSleep), name: NSWorkspace.willSleepNotification, object: nil)
+        center.addObserver(self, selector: #selector(systemDidWake), name: NSWorkspace.didWakeNotification, object: nil)
+    }
+
+    private func startMemoryPressureMonitoring() {
+        guard memoryPressureSource == nil else { return }
+        let source = DispatchSource.makeMemoryPressureSource(
+            eventMask: [.normal, .warning, .critical],
+            queue: .main
+        )
+        memoryPressureSource = source
+        source.setEventHandler { [weak self] in
+            guard let self, let event = self.memoryPressureSource?.data else { return }
+            self.memoryPressureEventFired(event)
+        }
+        source.activate()
+    }
+
+    private func memoryPressureEventFired(_ event: DispatchSource.MemoryPressureEvent) {
+        let previousStatus = status
+        if event.contains(.critical) {
+            memoryPressureState = .critical
+        } else if event.contains(.warning) {
+            memoryPressureState = .warning
+        } else if event.contains(.normal) {
+            memoryPressureState = .normal
+        } else {
+            memoryPressureState = SystemMetrics.memoryPressureState()
+        }
+        publishUpdate(previousStatus: previousStatus, recordSample: true)
+
+        if memoryPressureState != .normal {
+            requestProcessCollectionIfDue(protectedFrontmostPID: lastExternalFrontmostPID)
+        }
+    }
+
+    private func publishUpdate(previousStatus: HealthStatus, recordSample: Bool) {
+        let currentStatus = status
+        if recordSample {
+            history.append(HealthSample(
+                timestamp: .now,
+                memoryFraction: memoryFraction,
+                cpuUsageFraction: cpuUsageFraction,
+                status: currentStatus
+            ))
+            if history.count > 450 { history.removeFirst(history.count - 450) }
+        }
+
+        let now = Date.now
+        if alertsEnabled,
+           currentStatus == .strained,
+           previousStatus != .strained,
+           now.timeIntervalSince(lastStrainedNotification) >= 15 * 60 {
+            lastStrainedNotification = now
+            NotificationManager.sendStrainedNotification(
+                memory: memorySummary,
+                cpu: cpuSummary,
+                cause: dominantLoadCause
+            )
+        }
+        postUpdate()
     }
 
     private func postUpdate() {
         NotificationCenter.default.post(name: .systemMonitorDidUpdate, object: self)
+    }
+
+    private func requestProcessCollection(protectedFrontmostPID: Int32?) {
+        guard !processCollectionInFlight else {
+            processCollectionPending = true
+            return
+        }
+
+        processCollectionInFlight = true
+        lastProcessCollection = .now
+        Task { [weak self] in
+            let processes = await Task.detached(priority: .utility) {
+                SystemMetrics.topProcesses()
+            }.value
+            guard let self else { return }
+            self.processCollectionInFlight = false
+            self.topProcesses = self.decorate(processes, protectedFrontmostPID: protectedFrontmostPID)
+            self.postUpdate()
+
+            if self.processCollectionPending {
+                self.processCollectionPending = false
+                self.requestProcessCollectionIfDue(protectedFrontmostPID: self.lastExternalFrontmostPID)
+            }
+        }
+    }
+
+    private func requestProcessCollectionIfDue(protectedFrontmostPID: Int32?) {
+        let elapsed = Date.now.timeIntervalSince(lastProcessCollection)
+        guard SystemHealthPolicy.shouldCollectProcesses(
+            force: false,
+            dashboardVisible: false,
+            status: status,
+            elapsed: elapsed
+        ) else { return }
+        requestProcessCollection(protectedFrontmostPID: protectedFrontmostPID)
     }
 
     private func decorate(
@@ -205,13 +382,22 @@ final class SystemMonitor: NSObject {
         ]
 
         return processes.map { process in
-            let application = runningApplications.first { application in
-                guard let bundlePath = process.bundlePath,
-                      let applicationPath = application.bundleURL?.standardizedFileURL.path
-                else { return application.processIdentifier == process.id }
-                return applicationPath == bundlePath
+            guard let bundlePath = process.bundlePath else { return process }
+            let applications = runningApplications.filter { application in
+                application.bundleURL?.standardizedFileURL.path == bundlePath
             }
-            guard let application else { return process }
+            guard applications.count == 1, let application = applications.first else {
+                return ProcessSnapshot(
+                    id: process.id,
+                    name: process.name,
+                    cpu: process.cpu,
+                    memoryMB: process.memoryMB,
+                    bundlePath: process.bundlePath,
+                    bundleIdentifier: applications.first?.bundleIdentifier,
+                    isRegularApplication: false,
+                    isProtected: true
+                )
+            }
             let bundleIdentifier = application.bundleIdentifier
             let applicationPID = application.processIdentifier
             let protected = applicationPID == protectedFrontmostPID ||
@@ -234,11 +420,23 @@ final class SystemMonitor: NSObject {
 enum HealthStatus: Equatable, Sendable {
     case calm, busy, strained
 
+    var severity: Int {
+        switch self {
+        case .calm: 0
+        case .busy: 1
+        case .strained: 2
+        }
+    }
+
+    static func maximum(_ lhs: HealthStatus, _ rhs: HealthStatus) -> HealthStatus {
+        lhs.severity >= rhs.severity ? lhs : rhs
+    }
+
     var title: String {
         switch self {
-        case .calm: "All clear"
-        case .busy: "Working hard"
-        case .strained: "Needs attention"
+        case .calm: tr("All clear", "상태 좋아")
+        case .busy: tr("Working hard", "조금 바빠")
+        case .strained: tr("Needs attention", "확인이 필요해")
         }
     }
 
@@ -252,9 +450,9 @@ enum HealthStatus: Equatable, Sendable {
 
     var energyColor: NSColor {
         switch self {
-        case .calm: NSColor(calibratedRed: 0.30, green: 0.55, blue: 1.00, alpha: 1)
+        case .calm: NSColor(calibratedRed: 0.25, green: 0.82, blue: 0.52, alpha: 1)
         case .busy: NSColor(calibratedRed: 1.00, green: 0.68, blue: 0.20, alpha: 1)
-        case .strained: NSColor(calibratedRed: 0.94, green: 0.33, blue: 0.52, alpha: 1)
+        case .strained: NSColor(calibratedRed: 1.00, green: 0.25, blue: 0.25, alpha: 1)
         }
     }
 
@@ -262,7 +460,7 @@ enum HealthStatus: Equatable, Sendable {
         switch self {
         case .calm: "face.smiling"
         case .busy: "bolt.heart"
-        case .strained: "exclamationmark.heart"
+        case .strained: "exclamationmark.triangle.fill"
         }
     }
 }
@@ -276,12 +474,19 @@ private enum NotificationManager {
         }
     }
 
-    static func sendStrainedNotification(memory: String, cpu: String) {
+    static func sendStrainedNotification(memory: String, cpu: String, cause: SystemLoadCause) {
         let content = UNMutableNotificationContent()
-        content.title = "MacBuddy: 잠깐 확인해줘"
-        content.body = "메모리 \(memory), CPU load \(cpu). 메뉴바에서 무거운 앱을 확인해봐."
+        content.title = tr("MacBuddy needs a quick check", "MacBuddy: 잠깐 확인해줘")
+        switch cause {
+        case .memory:
+            content.body = tr("Memory pressure is high (\(memory)). Check heavy apps from the menu bar.", "메모리 압력이 높아 (\(memory)). 메뉴바에서 무거운 앱을 확인해봐.")
+        case .cpu:
+            content.body = tr("CPU usage is high (\(cpu)). Check active apps from the menu bar.", "CPU 사용률이 높아 (\(cpu)). 메뉴바에서 실행 중인 앱을 확인해봐.")
+        case .both:
+            content.body = tr("CPU usage is \(cpu), with \(memory). Check the menu bar.", "CPU 사용률 \(cpu), 메모리 \(memory). 메뉴바에서 확인해봐.")
+        }
         content.sound = .default
-        let request = UNNotificationRequest(identifier: "strained-\(Date().timeIntervalSince1970)", content: content, trigger: nil)
+        let request = UNNotificationRequest(identifier: "MacBuddy.strained", content: content, trigger: nil)
         UNUserNotificationCenter.current().add(request)
     }
 }
@@ -289,44 +494,103 @@ private enum NotificationManager {
 private enum SystemMetrics {
     struct Memory {
         let totalGB: Double
-        let availableGB: Double
-        let pressureFreePercent: Double
+        let headroomGB: Double
+        let headroomPercent: Double
+        let pressure: MemoryPressureState
         let swapGB: Double
     }
 
+    struct CPUTicks {
+        let user: UInt32
+        let system: UInt32
+        let idle: UInt32
+        let nice: UInt32
+    }
+
     static func memory() -> Memory {
+        let host = mach_host_self()
+        defer { mach_port_deallocate(mach_task_self_, host) }
         var pageSize: vm_size_t = 0
-        guard host_page_size(mach_host_self(), &pageSize) == KERN_SUCCESS else {
-            return Memory(totalGB: 0, availableGB: 0, pressureFreePercent: 0, swapGB: 0)
+        guard host_page_size(host, &pageSize) == KERN_SUCCESS else {
+            return Memory(totalGB: 0, headroomGB: 0, headroomPercent: 0, pressure: .unknown, swapGB: 0)
         }
         let pageByteSize = Double(pageSize)
         var stats = vm_statistics64()
         var count = mach_msg_type_number_t(MemoryLayout<vm_statistics64_data_t>.stride / MemoryLayout<integer_t>.stride)
         let result = withUnsafeMutablePointer(to: &stats) {
             $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
-                host_statistics64(mach_host_self(), HOST_VM_INFO64, $0, &count)
+                host_statistics64(host, HOST_VM_INFO64, $0, &count)
             }
         }
 
         let totalBytes = Double(ProcessInfo.processInfo.physicalMemory)
         guard result == KERN_SUCCESS, totalBytes > 0 else {
-            return Memory(totalGB: 0, availableGB: 0, pressureFreePercent: 0, swapGB: 0)
+            return Memory(totalGB: 0, headroomGB: 0, headroomPercent: 0, pressure: .unknown, swapGB: 0)
         }
 
-        let reclaimableBytes = Double(stats.free_count + stats.inactive_count + stats.speculative_count) * pageByteSize
-        let fallbackPercent = min(max(reclaimableBytes / totalBytes * 100, 0), 100)
-        let pressurePercent = pressureFreePercent() ?? fallbackPercent
+        let headroom = SystemHealthPolicy.memoryHeadroom(
+            pageCounts: VMPageCounts(
+                free: UInt64(stats.free_count),
+                inactive: UInt64(stats.inactive_count),
+                speculative: UInt64(stats.speculative_count),
+                purgeable: UInt64(stats.purgeable_count)
+            ),
+            pageByteSize: pageByteSize,
+            totalBytes: totalBytes
+        )
         return Memory(
             totalGB: totalBytes.gigabytes,
-            availableGB: totalBytes.gigabytes * pressurePercent / 100,
-            pressureFreePercent: pressurePercent,
+            headroomGB: headroom.bytes.gigabytes,
+            headroomPercent: headroom.percent,
+            pressure: memoryPressureState(),
             swapGB: swapUsageGB()
         )
     }
 
-    static func cpuLoad() -> Double {
-        var loads = [Double](repeating: 0, count: 3)
-        return getloadavg(&loads, 3) > 0 ? loads[0] : 0
+    static func memoryPressureState() -> MemoryPressureState {
+        var level: Int32 = 0
+        var size = MemoryLayout<Int32>.size
+        guard sysctlbyname("kern.memorystatus_vm_pressure_level", &level, &size, nil, 0) == 0 else {
+            return .unknown
+        }
+        switch level {
+        case 1: return .normal
+        case 2: return .warning
+        case 4: return .critical
+        default: return .unknown
+        }
+    }
+
+    static func cpuTicks() -> CPUTicks? {
+        let host = mach_host_self()
+        defer { mach_port_deallocate(mach_task_self_, host) }
+        var info = host_cpu_load_info_data_t()
+        var count = mach_msg_type_number_t(
+            MemoryLayout<host_cpu_load_info_data_t>.stride / MemoryLayout<integer_t>.stride
+        )
+        let result = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                host_statistics(host, HOST_CPU_LOAD_INFO, $0, &count)
+            }
+        }
+        guard result == KERN_SUCCESS else { return nil }
+        return CPUTicks(
+            user: info.cpu_ticks.0,
+            system: info.cpu_ticks.1,
+            idle: info.cpu_ticks.2,
+            nice: info.cpu_ticks.3
+        )
+    }
+
+    static func cpuUsagePercent(from previous: CPUTicks, to current: CPUTicks) -> Double {
+        let user = UInt64(current.user &- previous.user)
+        let system = UInt64(current.system &- previous.system)
+        let idle = UInt64(current.idle &- previous.idle)
+        let nice = UInt64(current.nice &- previous.nice)
+        let busy = user + system + nice
+        let total = busy + idle
+        guard total > 0 else { return 0 }
+        return min(max(Double(busy) / Double(total) * 100, 0), 100)
     }
 
     static func freeDiskGB() -> Double {
@@ -421,26 +685,6 @@ private enum SystemMetrics {
         return result == 0 ? Double(usage.xsu_used).gigabytes : 0
     }
 
-    private static func pressureFreePercent() -> Double? {
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/usr/bin/memory_pressure")
-        task.arguments = ["-Q"]
-        let output = Pipe()
-        task.standardOutput = output
-
-        do {
-            try task.run()
-            task.waitUntilExit()
-            guard task.terminationStatus == 0,
-                  let text = String(data: output.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8),
-                  let match = text.range(of: #"System-wide memory free percentage:\s*([0-9]+)%"#, options: .regularExpression)
-            else { return nil }
-            let value = text[match].components(separatedBy: CharacterSet.decimalDigits.inverted).joined()
-            return Double(value)
-        } catch {
-            return nil
-        }
-    }
 }
 
 private extension Double {
