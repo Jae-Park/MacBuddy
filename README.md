@@ -1,6 +1,20 @@
-# MacBuddy
+<p align="center">
+  <img src="Support/MacBuddy-icon.png" alt="MacBuddy icon" width="128">
+</p>
 
-<img src="Support/MacBuddy-icon.png" alt="MacBuddy icon" width="160">
+<h1 align="center">MacBuddy</h1>
+
+<p align="center"><strong>A tiny floating pixel companion for your Mac's system health.</strong></p>
+
+<p align="center">
+  <img src="docs/assets/macbuddy-characters.png" alt="Mint Buddy, Memory Chip, and Strawberry Cake animations" width="432">
+</p>
+
+<p align="center">
+  <a href="https://github.com/Jae-Park/MacBuddy/releases/latest"><strong>Download the latest release →</strong></a>
+  ·
+  <a href="docs/INSTALL.md">Installation help</a>
+</p>
 
 MacBuddy is a lightweight macOS menu bar app with a tiny floating pixel companion that shows your Mac's system health at a glance.
 
@@ -28,7 +42,9 @@ It monitors memory pressure, swap usage, CPU load, free startup-disk space, and 
 2. Open the DMG and drag `MacBuddy.app` into the Applications folder.
 3. This beta is not signed with a Developer ID. On first launch, Control-click the app in Finder and choose **Open**.
 
-The current release is an ad-hoc signed beta built without the Apple Developer Program. A macOS security warning is expected; you do not need to disable security settings in Terminal.
+The current release is an ad-hoc signed beta built without the Apple Developer Program. A macOS security warning is expected; you do not need to disable Gatekeeper or run a Terminal command. See the [step-by-step installation and troubleshooting guide](docs/INSTALL.md) if macOS blocks the first launch.
+
+Versions before 0.5.0 do not contain the updater. Install 0.5.0 or later manually once; future signed updates can then arrive through MacBuddy.
 
 ## Usage
 
@@ -79,6 +95,8 @@ Created by **Jaeyong Park**.
 
 MacBuddy는 화면 위에 떠 있는 작은 픽셀 캐릭터로 macOS의 시스템 상태를 한눈에 보여주는 가벼운 메뉴 막대 앱입니다.
 
+[최신 릴리스 다운로드 →](https://github.com/Jae-Park/MacBuddy/releases/latest) · [설치 도움말](docs/INSTALL.md#한국어)
+
 메모리 압력, swap 사용량, CPU 부하, 시동 디스크 여유 공간과 메모리를 많이 사용하는 앱을 **기기 안에서만** 확인합니다. 캐릭터 머리 위의 작은 에너지바로 전체 상태를 빠르게 읽고, 캐릭터를 클릭하면 간결한 두 줄짜리 메모리 상태 메시지를 볼 수 있습니다.
 
 ## 주요 기능
@@ -104,6 +122,8 @@ MacBuddy는 화면 위에 떠 있는 작은 픽셀 캐릭터로 macOS의 시스�
 3. Developer ID로 서명되지 않은 베타이므로 최초 실행 시 Finder에서 앱을 Control-클릭하고 **열기**를 선택합니다.
 
 현재 배포판은 Apple Developer Program 없이 만든 ad-hoc signed beta입니다. macOS의 보안 경고가 표시되는 것이 정상이며, 터미널에서 보안 설정을 해제할 필요는 없습니다.
+
+macOS가 최초 실행을 차단하면 [단계별 설치 및 문제 해결 안내](docs/INSTALL.md#한국어)를 확인하세요. 0.5.0 이전 버전에는 업데이터가 없으므로 0.5.0 이상을 한 번 직접 설치해야 하며, 이후부터 MacBuddy 안에서 서명된 업데이트를 받을 수 있습니다.
 
 ## 사용법
 
