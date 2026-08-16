@@ -3,6 +3,7 @@ import AppKit
 @MainActor
 final class MascotWindowController: NSObject {
     private let monitor: SystemMonitor
+    private let checkForUpdates: () -> Void
     private var panel: NSPanel?
     private var mascotView: MascotCanvasView?
     private let panelSize = NSSize(width: 156, height: 238)
@@ -11,8 +12,9 @@ final class MascotWindowController: NSObject {
 
     var isVisible: Bool { panel?.isVisible == true }
 
-    init(monitor: SystemMonitor) {
+    init(monitor: SystemMonitor, checkForUpdates: @escaping () -> Void) {
         self.monitor = monitor
+        self.checkForUpdates = checkForUpdates
         super.init()
         NotificationCenter.default.addObserver(
             self,
@@ -76,7 +78,11 @@ final class MascotWindowController: NSObject {
         panel.hidesOnDeactivate = false
         panel.isMovableByWindowBackground = false
 
-        let mascotView = MascotCanvasView(frame: NSRect(origin: .zero, size: panelSize), monitor: monitor)
+        let mascotView = MascotCanvasView(
+            frame: NSRect(origin: .zero, size: panelSize),
+            monitor: monitor,
+            checkForUpdates: checkForUpdates
+        )
         panel.contentView = mascotView
 
         if let screen = NSScreen.main {
@@ -150,6 +156,7 @@ final class MascotWindowController: NSObject {
 @MainActor
 private final class MascotCanvasView: NSView {
     private let monitor: SystemMonitor
+    private let checkForUpdates: () -> Void
     private var character = CharacterKind.selected
     private var spritePack: SpriteFramePack
     private var expanded = false
@@ -198,13 +205,11 @@ private final class MascotCanvasView: NSView {
 
     override var isFlipped: Bool { true }
 
-    init(frame frameRect: NSRect, monitor: SystemMonitor) {
+    init(frame frameRect: NSRect, monitor: SystemMonitor, checkForUpdates: @escaping () -> Void) {
         self.monitor = monitor
+        self.checkForUpdates = checkForUpdates
         self.spritePack = SpriteFramePack(kind: CharacterKind.selected)
         super.init(frame: frameRect)
-        wantsLayer = true
-        layer?.backgroundColor = NSColor.clear.cgColor
-        layer?.magnificationFilter = .nearest
         setAccessibilityElement(true)
         setAccessibilityRole(.button)
         updateAccessibility()
@@ -371,6 +376,10 @@ private final class MascotCanvasView: NSView {
         let optimize = NSMenuItem(title: tr("Optimize Memory…", "메모리 최적화…"), action: #selector(showMemoryOptimization), keyEquivalent: "")
         optimize.target = self
         menu.addItem(optimize)
+
+        let updates = NSMenuItem(title: tr("Check for Updates…", "업데이트 확인…"), action: #selector(checkForUpdatesNow), keyEquivalent: "")
+        updates.target = self
+        menu.addItem(updates)
         menu.addItem(.separator())
 
         let about = NSMenuItem(title: tr("About MacBuddy…", "MacBuddy 정보…"), action: #selector(showAboutPanel), keyEquivalent: "")
@@ -424,6 +433,10 @@ private final class MascotCanvasView: NSView {
             optimizationWindow = controller
         }
         optimizationWindow?.present()
+    }
+
+    @objc private func checkForUpdatesNow() {
+        checkForUpdates()
     }
 
     @objc private func advanceIdleAnimation() {
@@ -514,7 +527,7 @@ private final class MascotCanvasView: NSView {
     }
 
     private var energySegments: Int {
-        max(1, min(6, Int((monitor.energyLevel * 6).rounded())))
+        SystemHealthPolicy.energySegments(for: monitor.energyLevel)
     }
 
     private func updateAccessibility() {

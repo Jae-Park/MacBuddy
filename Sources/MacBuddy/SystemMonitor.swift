@@ -76,9 +76,7 @@ final class SystemMonitor: NSObject {
     private var cpuTimer: Timer?
     private var memoryPressureSource: (any DispatchSourceMemoryPressure)?
     private var previousCPUTicks: SystemMetrics.CPUTicks?
-    private var cpuStatus = HealthStatus.calm
-    private var pendingCPUStatus: HealthStatus?
-    private var pendingCPUStatusSamples = 0
+    private var cpuStatusTracker = CPUStatusTracker()
     private var dashboardVisible = false
     private var lastProcessCollection = Date.distantPast
     private var lastExternalFrontmostPID: Int32?
@@ -86,17 +84,14 @@ final class SystemMonitor: NSObject {
     private var processCollectionPending = false
     private var lastStrainedNotification = Date.distantPast
 
+    private var cpuStatus: HealthStatus { cpuStatusTracker.status }
+
     var memoryFraction: Double {
         guard totalMemoryGB > 0 else { return 0 }
-        let headroomLoad = min(max(1 - memoryHeadroomPercent / 100, 0), 1)
-        switch memoryPressureState {
-        case .normal, .unknown:
-            return min(headroomLoad, 0.66)
-        case .warning:
-            return min(max(headroomLoad, 0.75), 0.89)
-        case .critical:
-            return 1
-        }
+        return SystemHealthPolicy.memoryLoadFraction(
+            headroomPercent: memoryHeadroomPercent,
+            pressure: memoryPressureState
+        )
     }
 
     var cpuUsageFraction: Double {
@@ -195,11 +190,13 @@ final class SystemMonitor: NSObject {
         let currentStatus = status
         publishUpdate(previousStatus: previousStatus, recordSample: history.isEmpty)
 
-        let processInterval: TimeInterval = currentStatus == .calm ? 30 : 12
         let elapsed = Date.now.timeIntervalSince(lastProcessCollection)
-        let shouldCollect = forceProcessList ||
-            (dashboardVisible && elapsed >= processInterval) ||
-            (currentStatus != .calm && elapsed >= processInterval)
+        let shouldCollect = SystemHealthPolicy.shouldCollectProcesses(
+            force: forceProcessList,
+            dashboardVisible: dashboardVisible,
+            status: currentStatus,
+            elapsed: elapsed
+        )
         guard shouldCollect else { return }
 
         requestProcessCollection(protectedFrontmostPID: lastExternalFrontmostPID)
@@ -253,7 +250,7 @@ final class SystemMonitor: NSObject {
         cpuUsagePercent = cpuUsagePercent > 0
             ? cpuUsagePercent * 0.35 + currentUsage * 0.65
             : currentUsage
-        updateCPUStatus()
+        cpuStatusTracker.update(usagePercent: cpuUsagePercent)
         publishUpdate(previousStatus: previousStatus, recordSample: true)
     }
 
@@ -264,9 +261,7 @@ final class SystemMonitor: NSObject {
     @objc private func systemDidWake() {
         previousCPUTicks = SystemMetrics.cpuTicks()
         cpuUsagePercent = 0
-        cpuStatus = .calm
-        pendingCPUStatus = nil
-        pendingCPUStatusSamples = 0
+        cpuStatusTracker.reset()
         refresh(forceProcessList: dashboardVisible)
     }
 
@@ -304,41 +299,8 @@ final class SystemMonitor: NSObject {
         publishUpdate(previousStatus: previousStatus, recordSample: true)
 
         if memoryPressureState != .normal {
-            requestProcessCollection(protectedFrontmostPID: lastExternalFrontmostPID)
+            requestProcessCollectionIfDue(protectedFrontmostPID: lastExternalFrontmostPID)
         }
-    }
-
-    private func updateCPUStatus() {
-        let target: HealthStatus
-        switch cpuStatus {
-        case .calm:
-            target = cpuUsagePercent >= 90 ? .strained : (cpuUsagePercent >= 75 ? .busy : .calm)
-        case .busy:
-            target = cpuUsagePercent >= 90 ? .strained : (cpuUsagePercent < 65 ? .calm : .busy)
-        case .strained:
-            target = cpuUsagePercent < 65 ? .calm : (cpuUsagePercent < 80 ? .busy : .strained)
-        }
-
-        guard target != cpuStatus else {
-            pendingCPUStatus = nil
-            pendingCPUStatusSamples = 0
-            return
-        }
-
-        if pendingCPUStatus == target {
-            pendingCPUStatusSamples += 1
-        } else {
-            pendingCPUStatus = target
-            pendingCPUStatusSamples = 1
-        }
-
-        let requiredSamples = target.severity > cpuStatus.severity
-            ? (target == .strained ? 5 : 3)
-            : 5
-        guard pendingCPUStatusSamples >= requiredSamples else { return }
-        cpuStatus = target
-        pendingCPUStatus = nil
-        pendingCPUStatusSamples = 0
     }
 
     private func publishUpdate(previousStatus: HealthStatus, recordSample: Bool) {
@@ -391,9 +353,20 @@ final class SystemMonitor: NSObject {
 
             if self.processCollectionPending {
                 self.processCollectionPending = false
-                self.requestProcessCollection(protectedFrontmostPID: self.lastExternalFrontmostPID)
+                self.requestProcessCollectionIfDue(protectedFrontmostPID: self.lastExternalFrontmostPID)
             }
         }
+    }
+
+    private func requestProcessCollectionIfDue(protectedFrontmostPID: Int32?) {
+        let elapsed = Date.now.timeIntervalSince(lastProcessCollection)
+        guard SystemHealthPolicy.shouldCollectProcesses(
+            force: false,
+            dashboardVisible: false,
+            status: status,
+            elapsed: elapsed
+        ) else { return }
+        requestProcessCollection(protectedFrontmostPID: protectedFrontmostPID)
     }
 
     private func decorate(
@@ -555,13 +528,20 @@ private enum SystemMetrics {
             return Memory(totalGB: 0, headroomGB: 0, headroomPercent: 0, pressure: .unknown, swapGB: 0)
         }
 
-        let headroomPages = stats.free_count + stats.inactive_count + stats.speculative_count + stats.purgeable_count
-        let headroomBytes = Double(headroomPages) * pageByteSize
-        let headroomPercent = min(max(headroomBytes / totalBytes * 100, 0), 100)
+        let headroom = SystemHealthPolicy.memoryHeadroom(
+            pageCounts: VMPageCounts(
+                free: UInt64(stats.free_count),
+                inactive: UInt64(stats.inactive_count),
+                speculative: UInt64(stats.speculative_count),
+                purgeable: UInt64(stats.purgeable_count)
+            ),
+            pageByteSize: pageByteSize,
+            totalBytes: totalBytes
+        )
         return Memory(
             totalGB: totalBytes.gigabytes,
-            headroomGB: headroomBytes.gigabytes,
-            headroomPercent: headroomPercent,
+            headroomGB: headroom.bytes.gigabytes,
+            headroomPercent: headroom.percent,
             pressure: memoryPressureState(),
             swapGB: swapUsageGB()
         )

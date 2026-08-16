@@ -1,5 +1,6 @@
 import AppKit
 import ServiceManagement
+import Sparkle
 
 @main
 enum MacBuddyMain {
@@ -17,14 +18,25 @@ enum MacBuddyMain {
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let monitor = SystemMonitor()
+    private let updaterController = SPUStandardUpdaterController(
+        startingUpdater: true,
+        updaterDelegate: nil,
+        userDriverDelegate: nil
+    )
     private var mascot: MascotWindowController?
     private var statusBar: StatusBarController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApplication.shared.setActivationPolicy(.accessory)
-        let mascot = MascotWindowController(monitor: monitor)
+        let updaterController = self.updaterController
+        let checkForUpdates = { updaterController.checkForUpdates(nil) }
+        let mascot = MascotWindowController(monitor: monitor, checkForUpdates: checkForUpdates)
         self.mascot = mascot
-        statusBar = StatusBarController(monitor: monitor, mascot: mascot)
+        statusBar = StatusBarController(
+            monitor: monitor,
+            mascot: mascot,
+            checkForUpdates: checkForUpdates
+        )
         monitor.start()
         mascot.show()
         LoginItemManager.enable()
@@ -57,14 +69,15 @@ private final class StatusBarController: NSObject, NSPopoverDelegate {
     private let mascot: MascotWindowController
     private let statusItem: NSStatusItem
     private let popover = NSPopover()
-    private let dashboard: DashboardViewController
+    private let checkForUpdates: () -> Void
+    private var dashboard: DashboardViewController?
     private var renderedStatus: HealthStatus?
 
-    init(monitor: SystemMonitor, mascot: MascotWindowController) {
+    init(monitor: SystemMonitor, mascot: MascotWindowController, checkForUpdates: @escaping () -> Void) {
         self.monitor = monitor
         self.mascot = mascot
+        self.checkForUpdates = checkForUpdates
         self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        self.dashboard = DashboardViewController(monitor: monitor, mascot: mascot)
         super.init()
 
         if let button = statusItem.button {
@@ -76,7 +89,6 @@ private final class StatusBarController: NSObject, NSPopoverDelegate {
 
         popover.behavior = .transient
         popover.animates = true
-        popover.contentViewController = dashboard
         popover.delegate = self
 
         NotificationCenter.default.addObserver(
@@ -99,6 +111,13 @@ private final class StatusBarController: NSObject, NSPopoverDelegate {
         if popover.isShown {
             popover.performClose(nil)
         } else {
+            let dashboard = DashboardViewController(
+                monitor: monitor,
+                mascot: mascot,
+                checkForUpdates: checkForUpdates
+            )
+            self.dashboard = dashboard
+            popover.contentViewController = dashboard
             dashboard.update()
             monitor.dashboardOpened()
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
@@ -107,7 +126,7 @@ private final class StatusBarController: NSObject, NSPopoverDelegate {
 
     @objc private func monitorDidUpdate() {
         updateStatusIcon()
-        if popover.isShown { dashboard.update() }
+        if popover.isShown { dashboard?.update() }
     }
 
     @objc private func languageDidChange() {
@@ -116,6 +135,11 @@ private final class StatusBarController: NSObject, NSPopoverDelegate {
 
     func popoverWillClose(_ notification: Notification) {
         monitor.dashboardClosed()
+    }
+
+    func popoverDidClose(_ notification: Notification) {
+        popover.contentViewController = nil
+        dashboard = nil
     }
 
     private func updateStatusIcon(force: Bool = false) {
@@ -136,6 +160,7 @@ private final class StatusBarController: NSObject, NSPopoverDelegate {
 private final class DashboardViewController: NSViewController {
     private let monitor: SystemMonitor
     private let mascot: MascotWindowController
+    private let checkForUpdates: () -> Void
 
     private let statusLabel = NSTextField(labelWithString: "")
     private let statusDot = NSTextField(labelWithString: "●")
@@ -151,9 +176,10 @@ private final class DashboardViewController: NSViewController {
     private let languagePopup = NSPopUpButton()
     private var optimizationWindow: MemoryOptimizationWindowController?
 
-    init(monitor: SystemMonitor, mascot: MascotWindowController) {
+    init(monitor: SystemMonitor, mascot: MascotWindowController, checkForUpdates: @escaping () -> Void) {
         self.monitor = monitor
         self.mascot = mascot
+        self.checkForUpdates = checkForUpdates
         super.init(nibName: nil, bundle: nil)
         preferredContentSize = NSSize(width: 330, height: 680)
         NotificationCenter.default.addObserver(
@@ -260,6 +286,10 @@ private final class DashboardViewController: NSViewController {
 
     @objc private func quitMacBuddy() {
         NSApplication.shared.terminate(nil)
+    }
+
+    @objc private func checkForUpdatesNow() {
+        checkForUpdates()
     }
 
     @objc private func showMemoryOptimization() {
@@ -413,16 +443,22 @@ private final class DashboardViewController: NSViewController {
         row.heightAnchor.constraint(equalToConstant: 30).isActive = true
         row.widthAnchor.constraint(equalToConstant: 298).isActive = true
         let refresh = NSButton(title: tr("Refresh now", "지금 새로고침"), target: self, action: #selector(refreshNow))
+        let updates = NSButton(title: tr("Updates…", "업데이트 확인…"), target: self, action: #selector(checkForUpdatesNow))
         let quit = NSButton(title: tr("Quit MacBuddy", "MacBuddy 종료"), target: self, action: #selector(quitMacBuddy))
         refresh.controlSize = .small
+        updates.controlSize = .small
         quit.controlSize = .small
         refresh.translatesAutoresizingMaskIntoConstraints = false
+        updates.translatesAutoresizingMaskIntoConstraints = false
         quit.translatesAutoresizingMaskIntoConstraints = false
         row.addSubview(refresh)
+        row.addSubview(updates)
         row.addSubview(quit)
         NSLayoutConstraint.activate([
             refresh.leadingAnchor.constraint(equalTo: row.leadingAnchor),
             refresh.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+            updates.centerXAnchor.constraint(equalTo: row.centerXAnchor),
+            updates.centerYAnchor.constraint(equalTo: row.centerYAnchor),
             quit.trailingAnchor.constraint(equalTo: row.trailingAnchor),
             quit.centerYAnchor.constraint(equalTo: row.centerYAnchor)
         ])
